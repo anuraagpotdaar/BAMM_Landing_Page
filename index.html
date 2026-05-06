@@ -1,0 +1,1454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BAMM, Body Avatar Motion Model</title>
+<meta name="description" content="Transform natural language and audio into realistic 3D character animation. Generate, customize, and export professional motion data with AI-powered tools." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
+
+<!-- Three.js r147 (last version with classic global examples/js scripts) -->
+<script src="https://unpkg.com/three@0.147.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/libs/fflate.min.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/loaders/FBXLoader.js"></script>
+
+<!-- ============ hero-canvas.jsx ============ -->
+<script type="text/babel">
+const { useEffect: _useEffect_HC, useRef: _useRef_HC, useState: _useState_HC } = React;
+
+function HeroCanvas() {
+  const containerRef = _useRef_HC(null);
+  const swapRef = _useRef_HC(null);
+  const [promptText, setPromptText] = _useState_HC("");
+  const reduced = useReducedMotion();
+
+  _useEffect_HC(() => {
+    const container = containerRef.current;
+    if (!container || !window.THREE) return;
+
+    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.setClearColor(0x000000, 0);
+    container.appendChild(renderer.domElement);
+    renderer.domElement.style.width = "100%";
+    renderer.domElement.style.height = "100%";
+    renderer.domElement.style.display = "block";
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(32, 1, 1, 4000);
+
+    // Cool blue-tinted lighting to match the deep-navy theme
+    scene.add(new THREE.AmbientLight(0x9bb6ff, 0.55));
+    const key = new THREE.DirectionalLight(0xffffff, 1.4);
+    key.position.set(220, 320, 220);
+    scene.add(key);
+    const rim = new THREE.DirectionalLight(0x88aaff, 0.9);
+    rim.position.set(-220, 120, -220);
+    scene.add(rim);
+    const fill = new THREE.DirectionalLight(0xb4c8ff, 0.4);
+    fill.position.set(0, -100, 200);
+    scene.add(fill);
+
+    const models = {
+      dance: { url: "salsa-dancing.fbx", obj: null, mixer: null, action: null },
+      run:   { url: "slow-run.fbx",      obj: null, mixer: null, action: null },
+    };
+    /* dance is the initial model. It stays in the scene continuously,
+       swapped to run (and back) only when the new word is fully typed. */
+    let activeKey = "dance";
+    let modelSphere = null;
+    const clock = new THREE.Clock();
+
+    const fitCamera = () => {
+      if (!modelSphere) return;
+      const fovV = (camera.fov * Math.PI) / 180;
+      const fovH = 2 * Math.atan(Math.tan(fovV / 2) * camera.aspect);
+      const fov = Math.min(fovV, fovH);
+      const distance = (modelSphere.radius / Math.sin(fov / 2)) * 0.95;
+      const dir = new THREE.Vector3(0.35, 0.08, 1).normalize();
+      camera.position.copy(modelSphere.center).addScaledVector(dir, distance);
+      camera.near = Math.max(0.1, distance - modelSphere.radius * 2);
+      camera.far = distance + modelSphere.radius * 4;
+      camera.updateProjectionMatrix();
+      camera.lookAt(modelSphere.center);
+    };
+
+    const reframe = (obj) => {
+      const box = new THREE.Box3().setFromObject(obj);
+      modelSphere = box.getBoundingSphere(new THREE.Sphere());
+      fitCamera();
+    };
+
+    swapRef.current = (key) => {
+      if (key === activeKey) return;
+      const curr = activeKey ? models[activeKey] : null;
+      if (curr && curr.obj) {
+        scene.remove(curr.obj);
+        curr.action && curr.action.stop();
+      }
+      if (key && models[key] && models[key].obj) {
+        const next = models[key];
+        scene.add(next.obj);
+        next.action && next.action.reset().play();
+        reframe(next.obj);
+      }
+      activeKey = key;
+    };
+
+    const loader = new THREE.FBXLoader();
+    Object.entries(models).forEach(([key, slot]) => {
+      loader.load(
+        slot.url,
+        (fbx) => {
+          slot.obj = fbx;
+          /* Mixamo character export quirk: the hair geometry shares a
+             multi-material with the body, and that material has an alphaMap
+             whose image bytes don't always make it through the FBX export.
+             When the alphaMap texture has no image data, the GPU samples it as
+             alpha=0 everywhere, so every hair fragment gets discarded by alpha
+             blending and the avatar appears bald.
+             Fix: if alphaMap has no loaded image, strip it and render the
+             material opaque so the hair geometry shows up as a solid cap.
+             If alphaMap *does* have data, use a permissive alphaTest cutout. */
+          fbx.traverse((c) => {
+            if (!c.isMesh) return;
+            const mats = Array.isArray(c.material) ? c.material : [c.material];
+            mats.forEach((m) => {
+              if (!m || !m.alphaMap) return;
+              const img = m.alphaMap.image;
+              const loaded = img && (img.width || img.data);
+              if (!loaded) {
+                m.alphaMap = null;
+                m.transparent = false;
+                m.alphaTest = 0;
+                m.depthWrite = true;
+              } else {
+                m.alphaTest = 0.1;
+                m.transparent = true;
+                m.depthWrite = true;
+                m.side = THREE.DoubleSide;
+              }
+              m.needsUpdate = true;
+            });
+          });
+          if (fbx.animations && fbx.animations.length) {
+            slot.mixer = new THREE.AnimationMixer(fbx);
+            slot.action = slot.mixer.clipAction(fbx.animations[0]);
+          }
+          /* Race-safe: if the typing machine already requested this model
+             before its FBX finished loading, add it to the scene now. */
+          if (key === activeKey) {
+            scene.add(fbx);
+            slot.action && slot.action.play();
+            reframe(fbx);
+          }
+        },
+        undefined,
+        (err) => console.error(`FBX load failed for ${key}:`, err)
+      );
+    });
+
+    function resize() {
+      const rect = container.getBoundingClientRect();
+      const w = Math.max(1, rect.width);
+      const h = Math.max(1, rect.height);
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      fitCamera();
+    }
+    const ro = new ResizeObserver(resize);
+    ro.observe(container);
+    resize();
+
+    let raf;
+    const animate = () => {
+      raf = requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+      const active = models[activeKey];
+      if (active && active.mixer && !reduced) active.mixer.update(dt);
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+      if (renderer.domElement.parentNode === container) {
+        container.removeChild(renderer.domElement);
+      }
+      renderer.dispose();
+      scene.traverse((o) => {
+        if (o.isMesh) {
+          o.geometry?.dispose();
+          if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose());
+          else o.material?.dispose();
+        }
+      });
+    };
+  }, [reduced]);
+
+  _useEffect_HC(() => {
+    const words = ["dance", "run"];
+    let wordIdx = 0;
+    let phase = "typing";
+    let charIdx = 0;
+    let phaseStartT = performance.now();
+    let lastTickT = performance.now();
+    let stopped = false;
+    const TYPE_MS = 110;
+    const ERASE_MS = 70;
+    const HOLD_MS = 3500;
+    const PAUSE_MS = 350;
+
+    const swapModel = (key) => { if (swapRef.current) swapRef.current(key); };
+
+    const id = setInterval(() => {
+      if (stopped) return;
+      const now = performance.now();
+      const word = words[wordIdx];
+
+      if (phase === "typing") {
+        if (now - lastTickT >= TYPE_MS) {
+          charIdx++;
+          setPromptText(word.slice(0, charIdx));
+          lastTickT = now;
+          if (charIdx >= word.length) {
+            // text fully revealed, swap model now (no-op if already this one)
+            phase = "holding";
+            phaseStartT = now;
+            swapModel(word);
+          }
+        }
+      } else if (phase === "holding") {
+        if (now - phaseStartT >= HOLD_MS) {
+          phase = "erasing";
+          lastTickT = now;
+        }
+      } else if (phase === "erasing") {
+        if (now - lastTickT >= ERASE_MS) {
+          charIdx--;
+          setPromptText(word.slice(0, Math.max(0, charIdx)));
+          lastTickT = now;
+          if (charIdx <= 0) {
+            wordIdx = (wordIdx + 1) % words.length;
+            phase = "paused";
+            phaseStartT = now;
+          }
+        }
+      } else if (phase === "paused") {
+        if (now - phaseStartT >= PAUSE_MS) {
+          phase = "typing";
+          charIdx = 0;
+          lastTickT = now;
+        }
+      }
+    }, 25);
+
+    return () => { stopped = true; clearInterval(id); };
+  }, []);
+
+  return (
+    <div className="hero-canvas hero-canvas--bare">
+      <div ref={containerRef} className="hero-canvas-frame" />
+      <div className="hero-prompt" aria-hidden>
+        <div className="hero-prompt-tag">bamm 2.0 · text → motion</div>
+        <div className="hero-prompt-row">
+          <span className="hero-prompt-arrow">›</span>
+          <span className="hero-prompt-text">{promptText}</span>
+          <span className="hero-prompt-caret" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function useReducedMotion() {
+  const [r, setR] = _useState_HC(false);
+  _useEffect_HC(() => {
+    const update = () => {
+      const root = document.querySelector(".bamm-root");
+      const overridden = root && root.dataset.reduced === "true";
+      const prefers = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      setR(overridden || prefers);
+    };
+    update();
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    mq.addEventListener?.("change", update);
+    const obs = new MutationObserver(update);
+    const root = document.querySelector(".bamm-root");
+    if (root) obs.observe(root, { attributes: true, attributeFilter: ["data-reduced"] });
+    return () => { mq.removeEventListener?.("change", update); obs.disconnect(); };
+  }, []);
+  return r;
+}
+
+window.HeroCanvas = HeroCanvas;
+window.useReducedMotion = useReducedMotion;
+</script>
+
+<!-- ============ feature-loops.jsx ============ -->
+<script type="text/babel">
+const { useEffect: _useEffect_FL, useState: _useState_FL } = React;
+
+function MusicToMotionLoop() {
+  const reduced = window.useReducedMotion();
+  const [t, setT] = _useState_FL(0);
+  _useEffect_FL(() => {
+    if (reduced) return;
+    let raf, last = performance.now();
+    const tick = (now) => { setT((x) => x + (now - last) / 1000); last = now; raf = requestAnimationFrame(tick); };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [reduced]);
+
+  const bars = 48;
+  const beat = Math.abs(Math.sin(t * 3.2));
+  const armL = Math.sin(t * 3.2) * 35;
+  const armR = -Math.sin(t * 3.2) * 35;
+  const hipL = Math.sin(t * 1.6) * 12;
+  const hipR = -Math.sin(t * 1.6) * 12;
+  const headBob = Math.abs(Math.sin(t * 3.2)) * 1.6;
+
+  const cx = 26, cy = 50 - headBob;
+  const j = (a, len, x0, y0) => {
+    const r = (a * Math.PI) / 180;
+    return [x0 + Math.sin(r) * len, y0 + Math.cos(r) * len];
+  };
+  const head = [cx, cy - 18];
+  const pelvis = [cx, cy + 8];
+  const lSh = [cx - 4.5, cy - 12], rSh = [cx + 4.5, cy - 12];
+  const lEl = j(180 + armL, 8, lSh[0], lSh[1]);
+  const rEl = j(180 + armR, 8, rSh[0], rSh[1]);
+  const lHa = j(180 + armL * 0.7, 8, lEl[0], lEl[1]);
+  const rHa = j(180 + armR * 0.7, 8, rEl[0], rEl[1]);
+  const lHi = [cx - 3, cy + 8], rHi = [cx + 3, cy + 8];
+  const lKn = j(0 + hipL, 9, lHi[0], lHi[1]);
+  const rKn = j(0 + hipR, 9, rHi[0], rHi[1]);
+  const lFo = j(0 + hipL * 0.5, 8, lKn[0], lKn[1]);
+  const rFo = j(0 + hipR * 0.5, 8, rKn[0], rKn[1]);
+  const bone = (a, b, k) => <line key={k} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke="rgba(255,255,255,0.92)" strokeWidth="0.85" strokeLinecap="round" vectorEffect="non-scaling-stroke" />;
+
+  return (
+    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} aria-hidden>
+      <line x1="6" y1="82" x2="48" y2="82" stroke="rgba(255,255,255,0.12)" strokeWidth="0.3" vectorEffect="non-scaling-stroke" />
+      <g>
+        <ellipse cx={cx} cy="82.6" rx="6.5" ry="0.85" fill="rgba(0,0,0,0.55)" />
+        <circle cx={head[0]} cy={head[1]} r="3.6" fill="rgba(8,12,28,0.4)" stroke="rgba(255,255,255,0.92)" strokeWidth="0.85" vectorEffect="non-scaling-stroke" />
+        {bone([cx, cy - 12], pelvis, "spine")}
+        {bone(lSh, rSh, "sh")} {bone(lHi, rHi, "hi")}
+        {bone(lSh, lEl, "la1")} {bone(lEl, lHa, "la2")}
+        {bone(rSh, rEl, "ra1")} {bone(rEl, rHa, "ra2")}
+        {bone(lHi, lKn, "ll1")} {bone(lKn, lFo, "ll2")}
+        {bone(rHi, rKn, "rl1")} {bone(rKn, rFo, "rl2")}
+      </g>
+      <line x1="54" y1="44" x2={cx + 6} y2={cy - 4} stroke="rgba(180,220,255,0.45)" strokeWidth="0.3" strokeDasharray="1.2 0.8" vectorEffect="non-scaling-stroke" />
+      <g>
+        {Array.from({ length: bars }).map((_, i) => {
+          const x = 54 + i * 0.95;
+          const amp = (Math.sin(t * 4 + i * 0.35) + Math.sin(t * 6 + i * 0.18)) * 0.25 + 0.5;
+          const h = 6 + amp * 44 * (0.6 + beat * 0.4);
+          return <rect key={i} x={x} y={50 - h / 2} width="0.55" height={h} fill="rgba(255,255,255,0.75)" />;
+        })}
+      </g>
+      <g fontFamily="ui-monospace, monospace" fontSize="3.4" fill="rgba(255,255,255,0.5)" letterSpacing="0.1em">
+        <text x="54" y="93">00:03</text>
+        <text x="98" y="93" textAnchor="end">00:08</text>
+      </g>
+    </svg>
+  );
+}
+
+function TrajectoryToMotionLoop() {
+  const reduced = window.useReducedMotion();
+  const [t, setT] = _useState_FL(0);
+  _useEffect_FL(() => {
+    if (reduced) return;
+    let raf, last = performance.now();
+    const tick = (now) => { setT((x) => x + (now - last) / 1000); last = now; raf = requestAnimationFrame(tick); };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [reduced]);
+
+  /* Two-phase loop:
+       0.00 – 0.40 : DRAW    , a stylus traces the path from left to right
+       0.40 – 0.95 : EXECUTE , a figure walks the freshly drawn path
+       0.95 – 1.00 : pause, then repeat */
+  const period = 6.5;
+  const u = reduced ? 0.7 : (t % period) / period;
+  const DRAW_END = 0.4;
+  const WALK_END = 0.95;
+  const drawProgress = u < DRAW_END ? u / DRAW_END : 1;
+  const walkProgress =
+    u < DRAW_END ? -1 :
+    u < WALK_END ? (u - DRAW_END) / (WALK_END - DRAW_END) :
+    1.05; // figure has just stepped past the end marker
+  const figureVisible = walkProgress >= 0 && walkProgress <= 1.05;
+
+  /* Smooth left-to-right path with one gentle dip+rise. Easy to read, has a
+     clear start (left) and end (right), no self-intersections, no rotation. */
+  const pathPt = (s) => {
+    const x = 14 + s * 72;
+    const y = 58 + Math.sin(s * Math.PI * 1.6 - Math.PI * 0.3) * 16;
+    return [x, y];
+  };
+  const samples = 120;
+  const fullPathD = Array.from({ length: samples + 1 }).map((_, i) => {
+    const [x, y] = pathPt(i / samples);
+    return `${i ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(" ");
+  const drawnSamples = Math.max(2, Math.floor(samples * drawProgress) + 1);
+  const drawnPathD = Array.from({ length: drawnSamples }).map((_, i) => {
+    const [x, y] = pathPt(i / samples);
+    return `${i ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(" ");
+
+  // walking figure (stays upright, walks the screen left to right)
+  const phase = reduced ? 0 : t * 5;
+  const armL = Math.sin(phase) * 22, armR = -armL;
+  const legL = Math.sin(phase) * 18, legR = -legL;
+  const [fx, fy] = pathPt(Math.max(0, Math.min(1, walkProgress)));
+  const j = (a, len, x0, y0) => {
+    const r = (a * Math.PI) / 180;
+    return [x0 + Math.sin(r) * len, y0 + Math.cos(r) * len];
+  };
+  const head = [fx, fy - 14];
+  const neck = [fx, fy - 10];
+  const pelvis = [fx, fy + 3];
+  const lSh = [fx - 3, fy - 10], rSh = [fx + 3, fy - 10];
+  const lEl = j(180 + armL, 4.5, lSh[0], lSh[1]);
+  const rEl = j(180 + armR, 4.5, rSh[0], rSh[1]);
+  const lHa = j(180 + armL * 0.7, 4.5, lEl[0], lEl[1]);
+  const rHa = j(180 + armR * 0.7, 4.5, rEl[0], rEl[1]);
+  const lHi = [fx - 2, fy + 3], rHi = [fx + 2, fy + 3];
+  const lKn = j(0 + legL, 5, lHi[0], lHi[1]);
+  const rKn = j(0 + legR, 5, rHi[0], rHi[1]);
+  const lFo = j(0 + legL * 0.5, 4.5, lKn[0], lKn[1]);
+  const rFo = j(0 + legR * 0.5, 4.5, rKn[0], rKn[1]);
+  const bone = (a, b, k) => <line key={k} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke="rgba(255,255,255,0.92)" strokeWidth="0.7" strokeLinecap="round" vectorEffect="non-scaling-stroke" />;
+
+  // stylus tip during the drawing phase
+  const stylus = pathPt(drawProgress);
+
+  // mode label + small dot indicator change with phase
+  const isDrawing = u < DRAW_END;
+  const modeLabel = isDrawing ? "drawing path" : "executing motion";
+
+  return (
+    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} aria-hidden>
+      {/* faint grid floor, stays the same intensity */}
+      {Array.from({ length: 7 }).map((_, i) => (
+        <line key={"h" + i} x1="6" y1={26 + i * 10} x2="94" y2={26 + i * 10} stroke="rgba(255,255,255,0.05)" strokeWidth="0.2" vectorEffect="non-scaling-stroke" />
+      ))}
+      {Array.from({ length: 9 }).map((_, i) => (
+        <line key={"v" + i} x1={10 + i * 10} y1="26" x2={10 + i * 10} y2="86" stroke="rgba(255,255,255,0.05)" strokeWidth="0.2" vectorEffect="non-scaling-stroke" />
+      ))}
+
+      {/* ghost of full path, only visible after drawing completes */}
+      {!isDrawing && (
+        <path d={fullPathD} stroke="rgba(255,255,255,0.18)" strokeWidth="0.5" fill="none" strokeDasharray="1.0 1.4" vectorEffect="non-scaling-stroke" />
+      )}
+      {/* drawn portion (during draw phase) or completed path (during walk phase) */}
+      <path d={drawnPathD} stroke="rgba(180,220,255,0.92)" strokeWidth="1.0" fill="none" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+
+      {/* start + end markers (visible after the path begins drawing) */}
+      {(() => {
+        const [sx, sy] = pathPt(0);
+        const [ex, ey] = pathPt(1);
+        return (
+          <g>
+            <circle cx={sx} cy={sy} r="1.8" fill="rgba(180,220,255,0.95)" />
+            <text x={sx} y={sy - 4} textAnchor="middle" fontFamily="ui-monospace, monospace" fontSize="2.6" fill="rgba(180,220,255,0.85)" letterSpacing="0.14em">start</text>
+            {drawProgress >= 1 && (
+              <g>
+                <circle cx={ex} cy={ey} r="1.8" fill="none" stroke="rgba(180,220,255,0.95)" strokeWidth="0.4" />
+                <text x={ex} y={ey - 4} textAnchor="middle" fontFamily="ui-monospace, monospace" fontSize="2.6" fill="rgba(180,220,255,0.85)" letterSpacing="0.14em">end</text>
+              </g>
+            )}
+          </g>
+        );
+      })()}
+
+      {/* stylus tip during drawing phase */}
+      {isDrawing && !reduced && (
+        <g>
+          <circle cx={stylus[0]} cy={stylus[1]} r="2.4" fill="none" stroke="rgba(180,220,255,0.95)" strokeWidth="0.4" />
+          <circle cx={stylus[0]} cy={stylus[1]} r="0.9" fill="rgba(180,220,255,1)" />
+          {/* aiming crosshair */}
+          <line x1={stylus[0] - 3.5} y1={stylus[1]} x2={stylus[0] - 1.6} y2={stylus[1]} stroke="rgba(180,220,255,0.6)" strokeWidth="0.3" />
+          <line x1={stylus[0] + 1.6} y1={stylus[1]} x2={stylus[0] + 3.5} y2={stylus[1]} stroke="rgba(180,220,255,0.6)" strokeWidth="0.3" />
+          <line x1={stylus[0]} y1={stylus[1] - 3.5} x2={stylus[0]} y2={stylus[1] - 1.6} stroke="rgba(180,220,255,0.6)" strokeWidth="0.3" />
+          <line x1={stylus[0]} y1={stylus[1] + 1.6} x2={stylus[0]} y2={stylus[1] + 3.5} stroke="rgba(180,220,255,0.6)" strokeWidth="0.3" />
+        </g>
+      )}
+
+      {/* figure walking the path */}
+      {figureVisible && (
+        <g>
+          <ellipse cx={fx} cy={fy + 11} rx="4" ry="0.6" fill="rgba(0,0,0,0.55)" />
+          <circle cx={head[0]} cy={head[1]} r="3" fill="rgba(8,12,28,0.5)" stroke="rgba(255,255,255,0.95)" strokeWidth="0.7" vectorEffect="non-scaling-stroke" />
+          {bone(neck, pelvis, "spine")}
+          {bone(lSh, rSh, "sh")} {bone(lHi, rHi, "hi")}
+          {bone(lSh, lEl, "la1")} {bone(lEl, lHa, "la2")}
+          {bone(rSh, rEl, "ra1")} {bone(rEl, rHa, "ra2")}
+          {bone(lHi, lKn, "ll1")} {bone(lKn, lFo, "ll2")}
+          {bone(rHi, rKn, "rl1")} {bone(rKn, rFo, "rl2")}
+        </g>
+      )}
+
+      {/* mode chip (top-left) */}
+      <g>
+        <rect x="6" y="6" width="44" height="9" rx="2" fill="rgba(8,12,28,0.65)" stroke="rgba(180,220,255,0.3)" strokeWidth="0.2" />
+        <circle cx="10" cy="10.5" r="1.1" fill={isDrawing ? "rgba(180,220,255,0.95)" : "rgba(180,255,210,0.95)"} />
+        <text x="13.5" y="11.6" fontFamily="ui-monospace, monospace" fontSize="3.2" fill="rgba(255,255,255,0.92)" letterSpacing="0.06em">{modeLabel}</text>
+      </g>
+
+      {/* timecode (bottom-right) */}
+      <text x="94" y="94" textAnchor="end" fontFamily="ui-monospace, monospace" fontSize="3" fill="rgba(255,255,255,0.45)" letterSpacing="0.1em">
+        {`${(u * (period / 1.5)).toFixed(1)}s · 30 fps`}
+      </text>
+    </svg>
+  );
+}
+
+function TextToMotionLoop() {
+  const reduced = window.useReducedMotion();
+  const [t, setT] = _useState_FL(0);
+  _useEffect_FL(() => {
+    if (reduced) return;
+    let raf, last = performance.now();
+    const tick = (now) => { setT((x) => x + (now - last) / 1000); last = now; raf = requestAnimationFrame(tick); };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [reduced]);
+
+  const PROMPTS = ["person walking quickly", "dancing salsa", "throws a punch"];
+  const period = 4.5;
+  const cycle = (t / period) % PROMPTS.length;
+  const idx = Math.floor(cycle);
+  const local = cycle - idx;
+  // avoid the global `window.prompt` shadow trap, headless Chromium chokes on it
+  const currentPrompt = PROMPTS[idx] || PROMPTS[0];
+  const reveal = Math.min(1, local * 1.6);
+  const typed = currentPrompt.slice(0, Math.floor(currentPrompt.length * (reduced ? 1 : reveal)));
+  const caret = (Math.floor(t * 2) % 2 === 0) ? "▍" : " ";
+
+  const ready = reduced ? 1 : Math.max(0, Math.min(1, (local - 0.6) / 0.3));
+  const phase = reduced ? 0 : t * (3 + idx * 0.6);
+  const armL = Math.sin(phase) * 26 * ready, armR = -armL;
+  const legL = Math.sin(phase) * 22 * ready, legR = -legL;
+
+  const driftX = idx === 0 ? (Math.sin(t * 0.6) * 14) : 0;
+  const cx = 68 + driftX, cy = 58;
+  const j = (a, len, x0, y0) => { const r = (a * Math.PI) / 180; return [x0 + Math.sin(r) * len, y0 + Math.cos(r) * len]; };
+  const head = [cx, cy - 17];
+  const pelvis = [cx, cy + 4];
+  const lSh = [cx - 4, cy - 11], rSh = [cx + 4, cy - 11];
+  const lEl = j(180 + armL, 6.5, lSh[0], lSh[1]);
+  const rEl = j(180 + armR, 6.5, rSh[0], rSh[1]);
+  const lHa = j(180 + armL * 0.7, 6.5, lEl[0], lEl[1]);
+  const rHa = j(180 + armR * 0.7, 6.5, rEl[0], rEl[1]);
+  const lHi = [cx - 2.6, cy + 4], rHi = [cx + 2.6, cy + 4];
+  const lKn = j(0 + legL, 7, lHi[0], lHi[1]);
+  const rKn = j(0 + legR, 7, rHi[0], rHi[1]);
+  const lFo = j(0 + legL * 0.5, 6.5, lKn[0], lKn[1]);
+  const rFo = j(0 + legR * 0.5, 6.5, rKn[0], rKn[1]);
+  const bone = (a, b, k) => <line key={k} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke="rgba(255,255,255,0.92)" strokeWidth="0.75" strokeLinecap="round" vectorEffect="non-scaling-stroke" />;
+
+  return (
+    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} aria-hidden>
+      <rect x="4" y="8" width="62" height="20" rx="3" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.2)" strokeWidth="0.3" />
+      <text x="8" y="20" fontFamily="ui-monospace, monospace" fontSize="4.6" fill="rgba(255,255,255,0.92)">
+        {typed}{caret}
+      </text>
+      <text x="8" y="38" fontFamily="ui-monospace, monospace" fontSize="3.2" fill="rgba(180,220,255,0.75)" letterSpacing="0.18em">
+        bamm 2.0 · text → motion
+      </text>
+      <path d="M66 18 C 76 18, 76 46, 84 46" stroke="rgba(180,220,255,0.55)" strokeWidth="0.5" fill="none" strokeDasharray="1.2 1.0" vectorEffect="non-scaling-stroke" />
+      <line x1="44" y1="78" x2="96" y2="78" stroke="rgba(255,255,255,0.12)" strokeWidth="0.3" vectorEffect="non-scaling-stroke" />
+      <ellipse cx={cx} cy="78.6" rx="5" ry="0.7" fill="rgba(0,0,0,0.55)" />
+      <circle cx={head[0]} cy={head[1]} r="3.2" fill="rgba(8,12,28,0.4)" stroke="rgba(255,255,255,0.92)" strokeWidth="0.75" vectorEffect="non-scaling-stroke" />
+      {bone([cx, cy - 11], pelvis, "spine")}
+      {bone(lSh, rSh, "sh")} {bone(lHi, rHi, "hi")}
+      {bone(lSh, lEl, "la1")} {bone(lEl, lHa, "la2")}
+      {bone(rSh, rEl, "ra1")} {bone(rEl, rHa, "ra2")}
+      {bone(lHi, lKn, "ll1")} {bone(lKn, lFo, "ll2")}
+      {bone(rHi, rKn, "rl1")} {bone(rKn, rFo, "rl2")}
+      <text x="6" y="94" fontFamily="ui-monospace, monospace" fontSize="3.2" fill="rgba(255,255,255,0.5)" letterSpacing="0.1em">
+        {`${(local * 4).toFixed(1)}s · 30 fps`}
+      </text>
+    </svg>
+  );
+}
+
+window.MusicToMotionLoop = MusicToMotionLoop;
+window.TrajectoryToMotionLoop = TrajectoryToMotionLoop;
+window.TextToMotionLoop = TextToMotionLoop;
+
+// ----- Ambient loops for the Use Cases carousel -----
+// Each is a small SVG that conveys the mood of the use case.
+
+const _useTime = (reduced) => {
+  const [t, setT] = _useState_FL(0);
+  _useEffect_FL(() => {
+    if (reduced) return;
+    let raf, last = performance.now();
+    const tick = (now) => { setT((x) => x + (now - last) / 1000); last = now; raf = requestAnimationFrame(tick); };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [reduced]);
+  return t;
+};
+
+// Indie game prototyping, large wireframe figure cycling through 5 action poses,
+// motion-trail ghosts, version + iter counter, target reticle.
+function IterateLoop() {
+  const reduced = window.useReducedMotion();
+  const t = _useTime(reduced);
+
+  const POSES = [
+    { armL:  30, armR: -30, legL: -18, legR:  18, lean: -2 },  // run
+    { armL: -50, armR:  50, legL:  25, legR: -25, lean:  3 },  // jump
+    { armL:  70, armR: -10, legL: -10, legR:  10, lean:  0 },  // throw
+    { armL: -10, armR:  70, legL:  10, legR: -10, lean:  0 },  // throw-mirror
+    { armL:  60, armR:  60, legL: -22, legR:  22, lean: -5 },  // dodge
+  ];
+  const period = 1.0;
+  // clamp index defensively, headless rendering trips on negative-frame edge cases
+  const safeMod = (n, m) => ((n % m) + m) % m;
+  const cycle = isFinite(t) ? safeMod(t / period, POSES.length) : 0;
+  const idx = Math.max(0, Math.min(POSES.length - 1, Math.floor(cycle)));
+  const local = cycle - idx;
+  const next = (idx + 1) % POSES.length;
+  const lerp = (a, b, k) => a + (b - a) * k;
+  const lerpPose = (a, b, k) => {
+    const A = a || POSES[0], B = b || POSES[0];
+    return {
+      armL: lerp(A.armL, B.armL, k), armR: lerp(A.armR, B.armR, k),
+      legL: lerp(A.legL, B.legL, k), legR: lerp(A.legR, B.legR, k),
+      lean: lerp(A.lean, B.lean, k),
+    };
+  };
+  const pose = reduced ? POSES[0] : lerpPose(POSES[idx], POSES[next], local);
+
+  // big figure: ~70 units tall in 100-unit viewBox
+  const cx = 50, cy = 50 + pose.lean * 0.8;
+  const ARM = 11, LEG = 14, SH = 7, HEAD = 4;
+  const j = (a, len, x0, y0) => { const r = (a * Math.PI) / 180; return [x0 + Math.sin(r) * len, y0 + Math.cos(r) * len]; };
+  const head = [cx, cy - 22];
+  const neck = [cx, cy - 16];
+  const pelvis = [cx, cy + 6];
+  const lSh = [cx - SH/2, cy - 14], rSh = [cx + SH/2, cy - 14];
+  const lEl = j(180 + pose.armL, ARM, lSh[0], lSh[1]);
+  const rEl = j(180 + pose.armR, ARM, rSh[0], rSh[1]);
+  const lHa = j(180 + pose.armL * 0.7, ARM, lEl[0], lEl[1]);
+  const rHa = j(180 + pose.armR * 0.7, ARM, rEl[0], rEl[1]);
+  const lHi = [cx - 3, cy + 6], rHi = [cx + 3, cy + 6];
+  const lKn = j(0 + pose.legL, LEG, lHi[0], lHi[1]);
+  const rKn = j(0 + pose.legR, LEG, rHi[0], rHi[1]);
+  const lFo = j(0 + pose.legL * 0.5, LEG, lKn[0], lKn[1]);
+  const rFo = j(0 + pose.legR * 0.5, LEG, rKn[0], rKn[1]);
+  const bone = (a, b, k, op = 0.92, sw = 0.9) => <line key={k} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke={`rgba(255,255,255,${op})`} strokeWidth={sw} strokeLinecap="round" vectorEffect="non-scaling-stroke" />;
+  const joint = (p, k, r = 1.0) => <circle key={k} cx={p[0]} cy={p[1]} r={r} fill="rgba(255,255,255,0.92)" />;
+
+  // motion-blur ghosts of past poses
+  const ghost = (off, opacity) => {
+    const back = (idx - off + POSES.length) % POSES.length;
+    const p = lerpPose(POSES[back], POSES[(back + 1) % POSES.length], local);
+    const lEl2 = j(180 + p.armL, ARM, lSh[0], lSh[1]);
+    const rEl2 = j(180 + p.armR, ARM, rSh[0], rSh[1]);
+    const lHa2 = j(180 + p.armL * 0.7, ARM, lEl2[0], lEl2[1]);
+    const rHa2 = j(180 + p.armR * 0.7, ARM, rEl2[0], rEl2[1]);
+    const lKn2 = j(0 + p.legL, LEG, lHi[0], lHi[1]);
+    const rKn2 = j(0 + p.legR, LEG, rHi[0], rHi[1]);
+    return (
+      <g key={off} opacity={opacity}>
+        {bone(lSh, lEl2, "g1", 0.55, 0.7)}{bone(lEl2, lHa2, "g2", 0.55, 0.7)}
+        {bone(rSh, rEl2, "g3", 0.55, 0.7)}{bone(rEl2, rHa2, "g4", 0.55, 0.7)}
+        {bone(lHi, lKn2, "g5", 0.55, 0.7)}{bone(rHi, rKn2, "g6", 0.55, 0.7)}
+      </g>
+    );
+  };
+
+  const labels = ["run", "jump", "throw", "throw·m", "dodge"];
+
+  return (
+    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} aria-hidden>
+      {/* perspective floor */}
+      {Array.from({ length: 8 }).map((_, i) => (
+        <line key={"h" + i} x1="6" y1={75 + i * 3} x2="94" y2={75 + i * 3} stroke={`rgba(255,255,255,${0.04 + i * 0.012})`} strokeWidth="0.15" vectorEffect="non-scaling-stroke" />
+      ))}
+      {Array.from({ length: 9 }).map((_, i) => {
+        const x = 6 + i * 11;
+        return <line key={"v" + i} x1={x} y1="75" x2={50 + (x - 50) * 1.6} y2="96" stroke="rgba(255,255,255,0.06)" strokeWidth="0.15" vectorEffect="non-scaling-stroke" />;
+      })}
+      {/* version chip */}
+      <g>
+        <rect x="4" y="4" width="36" height="11" rx="2.5" fill="rgba(8,12,28,0.55)" stroke="rgba(180,200,255,0.22)" strokeWidth="0.2" />
+        <circle cx="8.5" cy="9.5" r="1.2" fill="rgba(180,220,255,0.95)" />
+        <text x="12" y="11.4" fontFamily="ui-monospace, monospace" fontSize="3.6" fill="rgba(255,255,255,0.92)">v{idx + 1} · {labels[idx]}</text>
+      </g>
+      {/* iter counter (right) */}
+      <g>
+        <rect x="68" y="4" width="28" height="11" rx="2.5" fill="rgba(8,12,28,0.55)" stroke="rgba(180,200,255,0.22)" strokeWidth="0.2" />
+        <text x="71" y="11.4" fontFamily="ui-monospace, monospace" fontSize="3.4" fill="rgba(180,220,255,0.85)" letterSpacing="0.06em">iter {Math.floor(t / period) + 1}</text>
+      </g>
+      {/* target reticle behind figure */}
+      <g stroke="rgba(180,220,255,0.32)" strokeWidth="0.2" fill="none" vectorEffect="non-scaling-stroke">
+        <circle cx={cx} cy={cy - 5} r="22" strokeDasharray="0.8 1.2" />
+        <circle cx={cx} cy={cy - 5} r="14" />
+        <line x1={cx - 26} y1={cy - 5} x2={cx - 22} y2={cy - 5} strokeWidth="0.4" />
+        <line x1={cx + 22} y1={cy - 5} x2={cx + 26} y2={cy - 5} strokeWidth="0.4" />
+      </g>
+      {/* motion ghosts */}
+      {!reduced && ghost(1, 0.4)}
+      {!reduced && ghost(2, 0.2)}
+      {/* shadow */}
+      <ellipse cx={cx} cy="80" rx="9" ry="0.9" fill="rgba(0,0,0,0.6)" />
+      {/* current figure */}
+      <circle cx={head[0]} cy={head[1]} r={HEAD} fill="rgba(8,12,28,0.4)" stroke="rgba(255,255,255,0.92)" strokeWidth="0.6" vectorEffect="non-scaling-stroke" />
+      {bone(neck, pelvis, "spine", 0.95, 1.0)}
+      {bone(lSh, rSh, "sh")}{bone(lHi, rHi, "hi")}
+      {bone(lSh, lEl, "la1")}{bone(lEl, lHa, "la2")}
+      {bone(rSh, rEl, "ra1")}{bone(rEl, rHa, "ra2")}
+      {bone(lHi, lKn, "ll1")}{bone(lKn, lFo, "ll2")}
+      {bone(rHi, rKn, "rl1")}{bone(rKn, rFo, "rl2")}
+      {[neck, pelvis, lSh, rSh, lEl, rEl, lHi, rHi, lKn, rKn].map((p, i) => joint(p, "j" + i))}
+    </svg>
+  );
+}
+
+// Film & TV previs, bigger camera + subject figure on a path, 7 shot frame
+// markers with thumbnail sketches, scrubbable timeline, take counter.
+function PrevisLoop() {
+  const reduced = window.useReducedMotion();
+  const t = _useTime(reduced);
+  const period = 6;
+  const u = reduced ? 0.2 : (t % period) / period;
+  const pathPt = (s) => {
+    const ang = s * Math.PI * 2;
+    return [50 + Math.sin(ang) * 34, 52 + Math.sin(ang * 2) * 16];
+  };
+  const samples = 100;
+  const pathD = Array.from({ length: samples + 1 }).map((_, i) => {
+    const [x, y] = pathPt(i / samples);
+    return `${i ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(" ");
+  const [cx, cy] = pathPt(u);
+  const [nx, ny] = pathPt((u + 0.005) % 1);
+  const heading = Math.atan2(nx - cx, cy - ny) * 180 / Math.PI;
+
+  // subject figure trailing slightly behind the camera
+  const subj = pathPt((u - 0.04 + 1) % 1);
+  const subjPhase = reduced ? 0 : t * 6;
+  const subjArmL = Math.sin(subjPhase) * 22;
+  const subjLegL = Math.sin(subjPhase) * 18;
+  const sj = (a, len, x0, y0) => { const r = (a * Math.PI) / 180; return [x0 + Math.sin(r) * len, y0 + Math.cos(r) * len]; };
+  const sCx = subj[0], sCy = subj[1];
+  const sHead = [sCx, sCy - 7];
+  const sLSh = [sCx - 1.6, sCy - 4.5], sRSh = [sCx + 1.6, sCy - 4.5];
+  const sLHi = [sCx - 1.2, sCy + 1], sRHi = [sCx + 1.2, sCy + 1];
+  const sLEl = sj(180 + subjArmL, 2.6, sLSh[0], sLSh[1]);
+  const sREl = sj(180 - subjArmL, 2.6, sRSh[0], sRSh[1]);
+  const sLKn = sj(0 + subjLegL, 2.8, sLHi[0], sLHi[1]);
+  const sRKn = sj(0 - subjLegL, 2.8, sRHi[0], sRHi[1]);
+  const sBone = (a, b, k) => <line key={k} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke="rgba(255,255,255,0.85)" strokeWidth="0.32" strokeLinecap="round" vectorEffect="non-scaling-stroke" />;
+
+  const SHOTS = [
+    { s: 0.08, label: "EST" },
+    { s: 0.22, label: "WS" },
+    { s: 0.36, label: "MS" },
+    { s: 0.5,  label: "CU" },
+    { s: 0.64, label: "OTS" },
+    { s: 0.78, label: "MS" },
+    { s: 0.92, label: "OUT" },
+  ];
+  const currentShot = SHOTS.findIndex((s, i) => u < s.s) - 1;
+  const shotIdx = Math.max(0, currentShot);
+
+  return (
+    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} aria-hidden>
+      {/* letterbox bars */}
+      <rect x="0" y="0" width="100" height="11" fill="rgba(0,0,0,0.7)" />
+      <rect x="0" y="89" width="100" height="11" fill="rgba(0,0,0,0.7)" />
+
+      {/* slate top-left */}
+      <g>
+        <rect x="3" y="2" width="32" height="7.5" rx="1.2" fill="rgba(255,255,255,0.95)" />
+        <rect x="3" y="2" width="32" height="2.5" rx="1.2" fill="rgba(8,12,28,0.95)" />
+        <text x="4.5" y="4.2" fontFamily="ui-monospace, monospace" fontSize="2" fill="rgba(255,255,255,0.95)">CLAPPER · BAMM</text>
+        <text x="4.5" y="8.5" fontFamily="ui-monospace, monospace" fontSize="3" fill="rgba(8,12,28,0.95)" fontWeight="600">SC 04 · TK {(Math.floor(t / period) + 1).toString().padStart(2, "0")}</text>
+      </g>
+
+      {/* take counter top-right */}
+      <g>
+        <circle cx="92" cy="6" r="3.8" fill="none" stroke="rgba(255,80,80,0.85)" strokeWidth="0.5" />
+        <circle cx="92" cy="6" r="2" fill={Math.floor(t * 1.4) % 2 === 0 ? "rgba(255,80,80,0.95)" : "rgba(255,80,80,0.3)"} />
+        <text x="86" y="7.5" textAnchor="end" fontFamily="ui-monospace, monospace" fontSize="2.6" fill="rgba(255,255,255,0.9)" letterSpacing="0.16em">REC</text>
+      </g>
+
+      {/* path */}
+      <path d={pathD} stroke="rgba(255,255,255,0.16)" strokeWidth="0.4" fill="none" strokeDasharray="0.8 1.2" vectorEffect="non-scaling-stroke" />
+      {/* progressed path */}
+      <path d={Array.from({ length: Math.max(2, Math.floor(samples * u) + 1) }).map((_, i) => {
+        const [x, y] = pathPt(i / samples);
+        return `${i ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
+      }).join(" ")} stroke="rgba(180,220,255,0.85)" strokeWidth="0.6" fill="none" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+
+      {/* shot frames as little storyboard tiles */}
+      {SHOTS.map((shot, i) => {
+        const [x, y] = pathPt(shot.s);
+        const active = i === shotIdx;
+        return (
+          <g key={i}>
+            <rect x={x - 4} y={y - 3} width="8" height="5" rx="0.5" fill={active ? "rgba(180,220,255,0.35)" : "rgba(8,12,28,0.7)"} stroke={active ? "rgba(180,220,255,0.95)" : "rgba(255,255,255,0.35)"} strokeWidth="0.25" vectorEffect="non-scaling-stroke" />
+            {/* tiny sketch lines inside the frame */}
+            <line x1={x - 3} y1={y - 1.5} x2={x + 3} y2={y - 1.5} stroke="rgba(255,255,255,0.5)" strokeWidth="0.2" vectorEffect="non-scaling-stroke" />
+            <line x1={x - 3} y1={y - 0.5} x2={x + 1.5} y2={y - 0.5} stroke="rgba(255,255,255,0.4)" strokeWidth="0.2" vectorEffect="non-scaling-stroke" />
+            <line x1={x - 3} y1={y + 0.5} x2={x + 2.5} y2={y + 0.5} stroke="rgba(255,255,255,0.3)" strokeWidth="0.2" vectorEffect="non-scaling-stroke" />
+            <text x={x} y={y + 4.5} textAnchor="middle" fontFamily="ui-monospace, monospace" fontSize="1.8" fill={active ? "rgba(180,220,255,0.95)" : "rgba(255,255,255,0.5)"} letterSpacing="0.1em">{shot.label}</text>
+          </g>
+        );
+      })}
+
+      {/* subject figure */}
+      <g>
+        <ellipse cx={sCx} cy={sCy + 4} rx="1.8" ry="0.3" fill="rgba(0,0,0,0.5)" />
+        <circle cx={sHead[0]} cy={sHead[1]} r="1.2" fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth="0.32" vectorEffect="non-scaling-stroke" />
+        {sBone([sCx, sCy - 4.5], [sCx, sCy + 1], "sp")}
+        {sBone(sLSh, sRSh, "sh")}{sBone(sLHi, sRHi, "hi")}
+        {sBone(sLSh, sLEl, "la")}{sBone(sRSh, sREl, "ra")}
+        {sBone(sLHi, sLKn, "ll")}{sBone(sRHi, sRKn, "rl")}
+      </g>
+
+      {/* camera (bigger) */}
+      <g transform={`translate(${cx} ${cy}) rotate(${heading})`}>
+        <rect x="-3.2" y="-2" width="5.5" height="4" rx="0.5" fill="rgba(255,255,255,0.95)" />
+        <rect x="-3.2" y="-2" width="5.5" height="0.8" rx="0.4" fill="rgba(180,220,255,0.95)" />
+        <polygon points="2.3,-1.6 5.2,-2.8 5.2,2.8 2.3,1.6" fill="rgba(255,255,255,0.95)" />
+        <circle cx="3.5" cy="0" r="0.8" fill="rgba(8,12,28,0.95)" />
+        {/* viewing cone */}
+        <path d="M 5.2 -2.8 L 18 -8 L 18 8 L 5.2 2.8 Z" fill="rgba(180,220,255,0.08)" stroke="rgba(180,220,255,0.4)" strokeWidth="0.2" />
+      </g>
+
+      {/* timeline scrubber */}
+      <g>
+        <rect x="6" y="92" width="88" height="3.2" rx="0.6" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.16)" strokeWidth="0.2" />
+        <rect x="6" y="92" width={88 * u} height="3.2" rx="0.6" fill="rgba(180,220,255,0.6)" />
+        {/* shot tick marks on timeline */}
+        {SHOTS.map((shot, i) => (
+          <line key={i} x1={6 + 88 * shot.s} y1="91.5" x2={6 + 88 * shot.s} y2="95.5" stroke="rgba(255,255,255,0.4)" strokeWidth="0.2" />
+        ))}
+        {/* playhead */}
+        <line x1={6 + 88 * u} y1="90.5" x2={6 + 88 * u} y2="96.5" stroke="rgba(180,220,255,0.95)" strokeWidth="0.4" />
+        <circle cx={6 + 88 * u} cy="93.6" r="0.9" fill="rgba(180,220,255,1)" />
+      </g>
+    </svg>
+  );
+}
+
+// VR / AR, 5 figures populating an AR plane, each performing its own action.
+// HUD chrome with corner brackets, scene label, hand reticle, depth markers.
+function XRLoop() {
+  const reduced = window.useReducedMotion();
+  const t = _useTime(reduced);
+
+  // each figure has its own action (action key drives armBase, armSwing, legSwing).
+  // scale doubles as depth proxy (smaller = farther back).
+  const FIGURES = [
+    { x: 18, y: 80, scale: 0.55, phase: 0.0, action: "wave"   },
+    { x: 36, y: 73, scale: 0.85, phase: 0.6, action: "walk"   },
+    { x: 56, y: 66, scale: 1.10, phase: 1.1, action: "dance"  },
+    { x: 76, y: 73, scale: 0.85, phase: 1.7, action: "stretch"},
+    { x: 90, y: 80, scale: 0.55, phase: 2.2, action: "idle"   },
+  ];
+
+  const j = (a, len, x0, y0) => { const r = (a * Math.PI) / 180; return [x0 + Math.sin(r) * len, y0 + Math.cos(r) * len]; };
+  const renderFigure = (f, i) => {
+    const ph = reduced ? 0 : t * 3 + f.phase;
+    let armL = 0, armR = 0, legL = 0, legR = 0, headTilt = 0;
+    if (f.action === "wave")    { armL = 150 + Math.sin(ph * 2) * 25; armR = -10; legL = -2; legR = 2; }
+    else if (f.action === "walk")    { armL = Math.sin(ph) * 22; armR = -armL; legL = Math.sin(ph) * 18; legR = -legL; }
+    else if (f.action === "dance")   { armL = Math.sin(ph) * 60; armR = -Math.sin(ph) * 60; legL = Math.sin(ph * 2) * 18; legR = -legL; headTilt = Math.sin(ph) * 6; }
+    else if (f.action === "stretch") { armL = 160; armR = -160; legL = 0; legR = 8; }
+    else                              { armL = Math.sin(ph * 0.6) * 8; armR = -armL; legL = 0; legR = 0; }
+
+    const cx = f.x, cy = f.y, s = f.scale;
+    const HEAD = 2.2 * s, ARM = 5 * s, LEG = 5 * s;
+    const head = [cx, cy - 11 * s];
+    const pelvis = [cx, cy + 1.5 * s];
+    const lSh = [cx - 2 * s, cy - 6.5 * s], rSh = [cx + 2 * s, cy - 6.5 * s];
+    const lEl = j(180 + armL, ARM, lSh[0], lSh[1]);
+    const rEl = j(180 + armR, ARM, rSh[0], rSh[1]);
+    const lHa = j(180 + armL * 0.7, ARM, lEl[0], lEl[1]);
+    const rHa = j(180 + armR * 0.7, ARM, rEl[0], rEl[1]);
+    const lHi = [cx - 1.4 * s, cy + 1.5 * s], rHi = [cx + 1.4 * s, cy + 1.5 * s];
+    const lKn = j(0 + legL, LEG, lHi[0], lHi[1]);
+    const rKn = j(0 + legR, LEG, rHi[0], rHi[1]);
+    const lFo = j(0 + legL * 0.5, LEG, lKn[0], lKn[1]);
+    const rFo = j(0 + legR * 0.5, LEG, rKn[0], rKn[1]);
+    const bone = (a, b, k) => <line key={k} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke="rgba(255,255,255,0.88)" strokeWidth={0.35} strokeLinecap="round" vectorEffect="non-scaling-stroke" />;
+    return (
+      <g key={i} opacity={Math.min(1, s + 0.2)}>
+        <ellipse cx={cx} cy={cy + 5.5 * s} rx={2.4 * s} ry="0.35" fill="rgba(0,0,0,0.45)" />
+        <circle cx={head[0] + headTilt * 0.1} cy={head[1]} r={HEAD} fill="rgba(8,12,28,0.4)" stroke="rgba(255,255,255,0.92)" strokeWidth="0.35" vectorEffect="non-scaling-stroke" />
+        {bone([cx, cy - 6.5 * s], pelvis, "sp")}
+        {bone(lSh, rSh, "sh")}{bone(lHi, rHi, "hi")}
+        {bone(lSh, lEl, "la1")}{bone(lEl, lHa, "la2")}
+        {bone(rSh, rEl, "ra1")}{bone(rEl, rHa, "ra2")}
+        {bone(lHi, lKn, "ll1")}{bone(lKn, lFo, "ll2")}
+        {bone(rHi, rKn, "rl1")}{bone(rKn, rFo, "rl2")}
+        {/* action label under each figure */}
+        <text x={cx} y={cy + 8 * s + 2.5} textAnchor="middle" fontFamily="ui-monospace, monospace" fontSize={Math.max(1.6, 1.8 * s)} fill="rgba(180,220,255,0.75)" letterSpacing="0.1em">{f.action}</text>
+      </g>
+    );
+  };
+
+  // animated reticle "tracking" the dance figure
+  const reticleAngle = reduced ? 0 : t * 0.5;
+  const tracked = FIGURES[2];
+  const reticleX = tracked.x + Math.cos(reticleAngle) * 1.5;
+  const reticleY = tracked.y - 4 + Math.sin(reticleAngle) * 1.5;
+
+  return (
+    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} aria-hidden>
+      {/* curved horizon grid (depth) */}
+      {Array.from({ length: 12 }).map((_, i) => {
+        const z = i / 11;
+        const y = 56 + z * 38;
+        const op = 0.04 + z * 0.18;
+        return <path key={"h" + i} d={`M0,${y} Q50,${y - 8} 100,${y}`} stroke={`rgba(255,255,255,${op})`} strokeWidth="0.18" fill="none" vectorEffect="non-scaling-stroke" />;
+      })}
+      {Array.from({ length: 13 }).map((_, i) => {
+        const x = (i / 12) * 100;
+        return <line key={"v" + i} x1={x} y1="56" x2={50 + (x - 50) * 2.4} y2="96" stroke="rgba(255,255,255,0.06)" strokeWidth="0.15" vectorEffect="non-scaling-stroke" />;
+      })}
+
+      {/* HUD corner brackets */}
+      <g stroke="rgba(180,220,255,0.55)" strokeWidth="0.3" fill="none" vectorEffect="non-scaling-stroke">
+        <path d="M3,12 L3,3 L12,3" />
+        <path d="M97,12 L97,3 L88,3" />
+        <path d="M3,88 L3,97 L12,97" />
+        <path d="M97,88 L97,97 L88,97" />
+      </g>
+
+      {/* scene chip */}
+      <g>
+        <rect x="36" y="2" width="28" height="7" rx="1.5" fill="rgba(8,12,28,0.6)" stroke="rgba(180,220,255,0.4)" strokeWidth="0.2" />
+        <circle cx="40" cy="5.5" r="1" fill="rgba(180,220,255,0.95)" />
+        <text x="43" y="6.8" fontFamily="ui-monospace, monospace" fontSize="2.6" fill="rgba(255,255,255,0.92)" letterSpacing="0.14em">XR · 5 ENT.</text>
+      </g>
+
+      {/* depth ruler on left */}
+      <g>
+        <line x1="5" y1="22" x2="5" y2="84" stroke="rgba(255,255,255,0.2)" strokeWidth="0.2" />
+        {[1, 2, 3, 4, 5].map((d) => (
+          <g key={d}>
+            <line x1="3.5" y1={22 + (d - 1) * 15.5} x2="6.5" y2={22 + (d - 1) * 15.5} stroke="rgba(255,255,255,0.4)" strokeWidth="0.2" />
+            <text x="9" y={22 + (d - 1) * 15.5 + 0.8} fontFamily="ui-monospace, monospace" fontSize="1.8" fill="rgba(255,255,255,0.4)">{d}m</text>
+          </g>
+        ))}
+      </g>
+
+      {/* figures */}
+      {FIGURES.map(renderFigure)}
+
+      {/* tracking reticle (around dance figure) */}
+      <g stroke="rgba(180,220,255,0.85)" strokeWidth="0.3" fill="none" vectorEffect="non-scaling-stroke">
+        <circle cx={reticleX} cy={reticleY} r="6" strokeDasharray="0.6 1.0" />
+        <line x1={reticleX - 8} y1={reticleY} x2={reticleX - 6.5} y2={reticleY} />
+        <line x1={reticleX + 6.5} y1={reticleY} x2={reticleX + 8} y2={reticleY} />
+        <line x1={reticleX} y1={reticleY - 8} x2={reticleX} y2={reticleY - 6.5} />
+        <line x1={reticleX} y1={reticleY + 6.5} x2={reticleX} y2={reticleY + 8} />
+        <text x={reticleX + 7} y={reticleY - 7} fontFamily="ui-monospace, monospace" fontSize="1.8" fill="rgba(180,220,255,0.85)">tracking</text>
+      </g>
+
+      {/* fps counter bottom-right */}
+      <g>
+        <rect x="74" y="91" width="22" height="6" rx="1" fill="rgba(8,12,28,0.6)" stroke="rgba(180,220,255,0.3)" strokeWidth="0.18" />
+        <text x="76" y="95.2" fontFamily="ui-monospace, monospace" fontSize="2.4" fill="rgba(180,220,255,0.85)">90 fps · 2 eyes</text>
+      </g>
+    </svg>
+  );
+}
+
+// Research, 3 joint trails over time, two stacked plots, big waveform, mini bar
+// chart, label callouts. Reads as a motion-data dashboard.
+function ResearchLoop() {
+  const reduced = window.useReducedMotion();
+  const t = _useTime(reduced);
+
+  const TRAILS = [
+    { freq: [2, 3], rad: [22, 12], color: "180,220,255", label: "wrist · L" },
+    { freq: [3, 2], rad: [18, 10], color: "200,180,255", label: "ankle · R" },
+    { freq: [1, 4], rad: [14, 8],  color: "180,255,210", label: "spine"     },
+  ];
+  const period = 4;
+  const u = reduced ? 0.25 : (t / period) % 1;
+  const N = 60;
+
+  return (
+    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} aria-hidden>
+      {/* dataset chip */}
+      <g>
+        <rect x="3" y="3" width="44" height="8" rx="1.5" fill="rgba(8,12,28,0.6)" stroke="rgba(180,220,255,0.3)" strokeWidth="0.2" />
+        <circle cx="7" cy="7" r="1.2" fill="rgba(180,255,210,0.95)" />
+        <text x="10.5" y="8.4" fontFamily="ui-monospace, monospace" fontSize="2.6" fill="rgba(255,255,255,0.92)" letterSpacing="0.1em">SET · BAMM-512 · 30hz</text>
+      </g>
+      {/* sample size top-right */}
+      <g>
+        <rect x="62" y="3" width="34" height="8" rx="1.5" fill="rgba(8,12,28,0.6)" stroke="rgba(180,220,255,0.3)" strokeWidth="0.2" />
+        <text x="65" y="8.4" fontFamily="ui-monospace, monospace" fontSize="2.6" fill="rgba(255,255,255,0.85)" letterSpacing="0.08em">N = {Math.floor(512 + Math.sin(t * 0.5) * 24)}</text>
+      </g>
+
+      {/* upper plot, joint scatter with 3 trails */}
+      <g>
+        {/* axes */}
+        <rect x="6" y="15" width="88" height="42" rx="1.5" fill="rgba(255,255,255,0.02)" stroke="rgba(255,255,255,0.14)" strokeWidth="0.2" />
+        {/* gridlines */}
+        {Array.from({ length: 5 }).map((_, i) => (
+          <line key={"gx" + i} x1="6" y1={15 + (i + 1) * 7} x2="94" y2={15 + (i + 1) * 7} stroke="rgba(255,255,255,0.05)" strokeWidth="0.12" />
+        ))}
+        {Array.from({ length: 7 }).map((_, i) => (
+          <line key={"gy" + i} x1={6 + (i + 1) * 11} y1="15" x2={6 + (i + 1) * 11} y2="57" stroke="rgba(255,255,255,0.05)" strokeWidth="0.12" />
+        ))}
+        {/* axis labels */}
+        <text x="9" y="20" fontFamily="ui-monospace, monospace" fontSize="2.2" fill="rgba(180,220,255,0.7)" letterSpacing="0.16em">θ · rad</text>
+        <text x="91" y="55" textAnchor="end" fontFamily="ui-monospace, monospace" fontSize="2.2" fill="rgba(255,255,255,0.4)">t →</text>
+
+        {/* trails */}
+        {TRAILS.map((tr, i) => {
+          const cy = 36;
+          const points = Array.from({ length: N }).map((_, k) => {
+            const s = (u - k * 0.008 + 1) % 1;
+            const ang = s * Math.PI * 2;
+            const x = 50 + Math.sin(ang * tr.freq[0]) * tr.rad[0];
+            const y = cy + Math.cos(ang * tr.freq[1]) * tr.rad[1];
+            return { x, y, op: 1 - k / N };
+          });
+          return (
+            <g key={i}>
+              {points.map((p, k) => (
+                <circle key={k} cx={p.x} cy={p.y} r={Math.max(0.3, 0.9 * p.op)} fill={`rgba(${tr.color},${p.op * 0.85})`} />
+              ))}
+              {/* head dot */}
+              <circle cx={points[0].x} cy={points[0].y} r="1.4" fill={`rgba(${tr.color},1)`} />
+              {/* label callout */}
+              <line x1={points[0].x} y1={points[0].y} x2={points[0].x + 6} y2={points[0].y - 4} stroke={`rgba(${tr.color},0.6)`} strokeWidth="0.2" />
+              <text x={points[0].x + 6.5} y={points[0].y - 3.5} fontFamily="ui-monospace, monospace" fontSize="1.8" fill={`rgba(${tr.color},0.9)`}>{tr.label}</text>
+            </g>
+          );
+        })}
+
+        {/* legend */}
+        <g>
+          {TRAILS.map((tr, i) => (
+            <g key={i} transform={`translate(${50 + i * 14}, 53)`}>
+              <circle cx="0" cy="0" r="0.9" fill={`rgba(${tr.color},1)`} />
+              <text x="2" y="0.8" fontFamily="ui-monospace, monospace" fontSize="1.8" fill="rgba(255,255,255,0.6)">ch{i + 1}</text>
+            </g>
+          ))}
+        </g>
+      </g>
+
+      {/* lower band, waveform + bar chart */}
+      <g>
+        <rect x="6" y="62" width="56" height="22" rx="1.5" fill="rgba(255,255,255,0.02)" stroke="rgba(255,255,255,0.14)" strokeWidth="0.2" />
+        <text x="9" y="66" fontFamily="ui-monospace, monospace" fontSize="2.2" fill="rgba(180,220,255,0.7)" letterSpacing="0.16em">amp · m/s²</text>
+        {Array.from({ length: 60 }).map((_, i) => {
+          const x = 8 + i * 0.9;
+          const amp = (Math.sin(t * 4 + i * 0.4) + Math.sin(t * 6 + i * 0.18)) * 0.25 + 0.5;
+          const h = 1 + amp * 14;
+          return <rect key={i} x={x} y={75 - h / 2} width="0.55" height={h} fill="rgba(180,220,255,0.7)" />;
+        })}
+
+        {/* bar chart on the right */}
+        <rect x="65" y="62" width="29" height="22" rx="1.5" fill="rgba(255,255,255,0.02)" stroke="rgba(255,255,255,0.14)" strokeWidth="0.2" />
+        <text x="68" y="66" fontFamily="ui-monospace, monospace" fontSize="2.2" fill="rgba(180,220,255,0.7)" letterSpacing="0.16em">err · per joint</text>
+        {[0, 1, 2, 3, 4, 5].map((i) => {
+          const h = 2 + Math.abs(Math.sin(t * 2 + i * 0.7)) * 12;
+          return (
+            <g key={i}>
+              <rect x={68 + i * 4} y={82 - h} width="3" height={h} fill="rgba(180,255,210,0.65)" />
+              <text x={68 + i * 4 + 1.5} y="86" textAnchor="middle" fontFamily="ui-monospace, monospace" fontSize="1.6" fill="rgba(255,255,255,0.4)">j{i}</text>
+            </g>
+          );
+        })}
+      </g>
+
+      {/* status line */}
+      <g>
+        <rect x="3" y="89" width="94" height="8" rx="1.5" fill="rgba(8,12,28,0.6)" stroke="rgba(255,255,255,0.16)" strokeWidth="0.2" />
+        <circle cx="7" cy="93" r="1" fill="rgba(180,255,210,0.95)" />
+        <text x="10" y="94.2" fontFamily="ui-monospace, monospace" fontSize="2.4" fill="rgba(255,255,255,0.78)">retarget · ok    │    loss {(0.0023 + Math.abs(Math.sin(t * 0.5)) * 0.001).toFixed(4)}    │    epoch {Math.floor(t * 0.8) + 142}</text>
+      </g>
+    </svg>
+  );
+}
+
+window.IterateLoop = IterateLoop;
+window.PrevisLoop = PrevisLoop;
+window.XRLoop = XRLoop;
+window.ResearchLoop = ResearchLoop;
+</script>
+
+<!-- ============ landing.jsx ============ -->
+<script type="text/babel">
+// Custom mark for Mixamo, Adobe property, no widely-used standalone brand icon.
+// Stylized character-pose "M" to evoke the motion-rigging product.
+const MixamoIcon = () => (
+  <svg viewBox="0 0 32 32" aria-hidden style={{ width: "100%", height: "100%" }}>
+    <g fill="currentColor">
+      <circle cx="16" cy="6.5" r="2.6" />
+      <path d="M7 26 L7 12 L11 12 L16 18 L21 12 L25 12 L25 26 L21 26 L21 17 L17 22 L15 22 L11 17 L11 26 Z" />
+    </g>
+  </svg>
+);
+
+// Brand-faithful SVGs are pulled from simpleicons.org's CDN (CC0-licensed).
+// Color is baked into the URL, `f4f5f7` matches `var(--fg)` against the navy backdrop.
+const ICON_TINT = "f4f5f7";
+const simpleIcon = (slug) => `https://cdn.simpleicons.org/${slug}/${ICON_TINT}`;
+
+const TOOLS = [
+  {
+    name: "Mixamo",
+    label: "mixamo",
+    fontStyle: { fontWeight: 500, textTransform: "lowercase", letterSpacing: "-0.02em" },
+    icon: <MixamoIcon />,
+  },
+  {
+    name: "Blender",
+    label: "blender",
+    fontStyle: { fontWeight: 700, textTransform: "lowercase", letterSpacing: "-0.015em" },
+    icon: <img src={simpleIcon("blender")} alt="" style={{ width: "100%", height: "100%", display: "block" }} />,
+  },
+  {
+    name: "Unity",
+    label: "Unity",
+    fontStyle: { fontWeight: 600, letterSpacing: "-0.02em" },
+    icon: <img src={simpleIcon("unity")} alt="" style={{ width: "100%", height: "100%", display: "block" }} />,
+  },
+  {
+    name: "Unreal",
+    label: "UNREAL ENGINE",
+    fontStyle: { fontWeight: 700, fontSize: "0.72em", letterSpacing: "0.12em" },
+    icon: <img src={simpleIcon("unrealengine")} alt="" style={{ width: "100%", height: "100%", display: "block" }} />,
+  },
+];
+
+function ToolWordmark({ name, label, fontStyle, icon }) {
+  return (
+    <div className="tool" aria-label={name}>
+      <span className="tool-glyph" aria-hidden>{icon}</span>
+      <span style={fontStyle}>{label}</span>
+    </div>
+  );
+}
+
+function ToolStripGrid() {
+  return (
+    <div className="tools-grid tools-grid-4 reveal reveal-stagger">
+      {TOOLS.map((t, i) => <ToolWordmark key={i} {...t} />)}
+    </div>
+  );
+}
+
+function FeatureCard({ tag, num, title, desc, hover, children }) {
+  return (
+    <article className="fcard" data-hover={hover}>
+      <div className="fcard-media">{children}</div>
+      <div className="fcard-body">
+        <div className="fcard-tag">
+          <span className="num">{num}</span>
+          <span>{tag}</span>
+        </div>
+        <h3 className="fcard-title">{title}</h3>
+        <p className="fcard-desc">{desc}</p>
+      </div>
+    </article>
+  );
+}
+
+function Nav() {
+  return (
+    <nav className="nav">
+      <div className="container nav-row">
+        <div className="brand">
+          <div className="brand-mark">B</div>
+          <span>BAMM</span>
+        </div>
+        <div className="nav-links">
+          <a href="#features">Features</a>
+          <a href="#how">How it works</a>
+          <a href="#tools">Integrations</a>
+          <a href="#examples">Examples</a>
+          <a href="#login" style={{ color: "var(--fg-3)" }}>Sign in</a>
+          <a href="#try" className="nav-cta">Start creating <span className="arrow">→</span></a>
+        </div>
+      </div>
+    </nav>
+  );
+}
+
+function PillRow() {
+  return (
+    <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 28 }}>
+      {["AI-powered motion generation", "Multi-format export", "Real-time 3D preview"].map((t) => (
+        <span key={t} className="hero-eyebrow" style={{ textTransform: "none", letterSpacing: 0, fontSize: 12 }}>{t}</span>
+      ))}
+    </div>
+  );
+}
+
+function Hero() {
+  return (
+    <section className="hero">
+      <div className="container hero-grid">
+        <div className="hero-copy">
+          <span className="hero-eyebrow load-up" style={{ "--load-delay": "0.05s" }}><span className="dot" /> body avatar motion model</span>
+          <h1 className="hero-title load-up" style={{ "--load-delay": "0.15s" }}>
+            3D animation<br />
+            from <span className="accent">text</span><br />
+            and <span className="accent">audio.</span>
+          </h1>
+          <p className="hero-sub load-up" style={{ "--load-delay": "0.35s" }}>
+            Transform natural language and audio into realistic 3D character animation. Generate,
+            customize, and export professional motion data, without the technical barriers.
+          </p>
+          <div className="hero-ctas load-up" style={{ "--load-delay": "0.5s" }}>
+            <a className="btn btn-primary" href="#try">Start creating <span className="arrow">→</span></a>
+          </div>
+          <div className="load-up" style={{ "--load-delay": "0.65s" }}><PillRow /></div>
+        </div>
+        <div className="hero-stage load-scale" style={{ "--load-delay": "0.25s" }}>
+          <window.HeroCanvas />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Tools() {
+  return (
+    <section className="tools" id="tools">
+      <div className="container">
+        <div className="reveal">
+          <div className="section-eyebrow">// integrations</div>
+          <h2 className="section-title">Drops into the tools you already use.</h2>
+        </div>
+        <ToolStripGrid />
+      </div>
+    </section>
+  );
+}
+
+function Features() {
+  return (
+    <section className="features" id="features">
+      <div className="container">
+        <div className="features-head reveal">
+          <div>
+            <div className="section-eyebrow">// capabilities</div>
+            <h2 className="section-title">Direct motion the way you think about it.</h2>
+          </div>
+          <p className="features-sub">
+            Two of the inputs BAMM understands. Each generates fully retargetable animation
+            you can take straight into your DCC of choice.
+          </p>
+        </div>
+        <div className="feature-grid feature-grid-3 reveal reveal-stagger">
+          <FeatureCard num="01" tag="text · BAMM 2.0" title="Text to Motion"
+            desc="Describe the action in plain language. BAMM generates the animation." hover="default">
+            <window.TextToMotionLoop />
+          </FeatureCard>
+          <FeatureCard num="02" tag="audio · DanceMosaic" title="Music to Motion"
+            desc="Drop in an 8–12 second audio clip. The character dances to it, on the beat." hover="default">
+            <window.MusicToMotionLoop />
+          </FeatureCard>
+          <FeatureCard num="03" tag="trajectory · MaskControl" title="Trajectory to Motion"
+            desc="Draw a path on the canvas. Motion follows it, with an optional prompt to shape the action." hover="default">
+            <window.TrajectoryToMotionLoop />
+          </FeatureCard>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+const STEPS = [
+  { num: "01", title: "Describe",  desc: "Type a prompt, hum a melody, or drop in audio. BAMM parses your intent and tempo." },
+  { num: "02", title: "Generate",  desc: "The motion model produces phase-consistent, retargetable animation in seconds." },
+  { num: "03", title: "Refine",    desc: "Edit with a follow-up prompt, redraw the trajectory, or nudge the beat lock." },
+  { num: "04", title: "Export",    desc: "Pull the rig into Mixamo, Blender, Unity, or Unreal, keyframes intact." },
+];
+
+function HowItWorks() {
+  return (
+    <section className="how" id="how">
+      <div className="container">
+        <div className="features-head reveal">
+          <div>
+            <div className="section-eyebrow">// pipeline</div>
+            <h2 className="section-title">From prompt to scene in four steps.</h2>
+          </div>
+          <p className="features-sub">
+            A typical run from a blank canvas to retargeted animation takes under a minute.
+            No motion-capture rig required.
+          </p>
+        </div>
+        <ol className="steps reveal reveal-stagger">
+          {STEPS.map((s, i) => (
+            <li key={s.num} className="step">
+              <span className="step-num">{s.num}</span>
+              <h3 className="step-title">{s.title}</h3>
+              <p className="step-desc">{s.desc}</p>
+              {i < STEPS.length - 1 ? <span className="step-arrow" aria-hidden>→</span> : null}
+            </li>
+          ))}
+        </ol>
+      </div>
+    </section>
+  );
+}
+
+const CASES = [
+  { num: "01", tag: "games · prototyping",    title: "Indie game prototyping", desc: "Block out character moves before mocap is even on the table. Iterate at the pace of design.",        Loop: () => <window.IterateLoop  /> },
+  { num: "02", tag: "film · previs",          title: "Film & TV previs",        desc: "Translate a director's note into shot-ready motion in minutes, not days.",                            Loop: () => <window.PrevisLoop   /> },
+  { num: "03", tag: "xr · virtual production",title: "VR / AR characters",      desc: "Populate immersive worlds with believable secondary motion at scale, without a per-character rigger.", Loop: () => <window.XRLoop       /> },
+  { num: "04", tag: "research · synthesis",   title: "Motion research",         desc: "Use BAMM as a controllable baseline for retargeting and synthesis experiments, reproducible, open.",   Loop: () => <window.ResearchLoop /> },
+];
+
+function UseCases() {
+  return (
+    <section className="cases" id="examples">
+      <div className="container">
+        <div className="features-head reveal">
+          <div>
+            <div className="section-eyebrow">// who it's for</div>
+            <h2 className="section-title">Built for the way motion actually ships.</h2>
+          </div>
+          <p className="features-sub">
+            From two-person studios to research labs, wherever a motion pipeline gets in the way of telling the story.
+          </p>
+        </div>
+        <div className="cases-carousel" tabIndex={0} aria-label="Use cases carousel">
+          <div className="cases-track">
+            {CASES.map((c) => {
+              const Loop = c.Loop;
+              return (
+                <article key={c.num} className="case-card">
+                  <div className="case-media" aria-hidden>
+                    <Loop />
+                  </div>
+                  <div className="case-body">
+                    <div className="case-tag">
+                      <span className="num">{c.num}</span>
+                      <span>{c.tag}</span>
+                    </div>
+                    <h3 className="case-title">{c.title}</h3>
+                    <p className="case-desc">{c.desc}</p>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function GetStartedCTA() {
+  return (
+    <section className="cta" id="start">
+      <div className="container cta-inner reveal">
+        <span className="hero-eyebrow"><span className="dot" /> ready when you are</span>
+        <h2 className="cta-title">Stop rigging.<br />Start <span className="accent">generating.</span></h2>
+        <p className="cta-sub">
+          Type your first prompt and watch motion appear in seconds. No mocap suit, no keyframes, no excuses.
+        </p>
+        <div className="cta-actions">
+          <a className="btn-cta" href="#try">
+            <span>Get started</span>
+            <span className="arrow">→</span>
+          </a>
+          <a className="btn-cta-ghost" href="#docs">Read the docs</a>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Footer() {
+  return (
+    <footer className="foot">
+      <div className="container foot-row">
+        <div className="brand">
+          <div className="brand-mark">B</div>
+          <span>BAMM</span>
+        </div>
+        <div className="foot-links">
+          <a href="#features">Features</a>
+          <a href="#how">How it works</a>
+          <a href="#docs">Docs</a>
+          <a href="#github">GitHub</a>
+          <a href="#contact">Contact</a>
+        </div>
+        <div>© 2026 BAMM Research</div>
+      </div>
+    </footer>
+  );
+}
+
+function useScrollReveal() {
+  const { useEffect } = React;
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("is-visible");
+            observer.unobserve(entry.target);
+          }
+        });
+      },
+      { threshold: 0.12, rootMargin: "0px 0px -8% 0px" }
+    );
+    document.querySelectorAll(".reveal").forEach((el) => observer.observe(el));
+    return () => observer.disconnect();
+  }, []);
+}
+
+function BammLanding() {
+  useScrollReveal();
+  return (
+    <div className="bamm-root" data-accent="cyan" data-density="default" data-reduced="false">
+      <Nav />
+      <Hero />
+      <Features />
+      <HowItWorks />
+      <Tools />
+      <UseCases />
+      <GetStartedCTA />
+      <Footer />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<BammLanding />);
+</script>
+</body>
+</html>
