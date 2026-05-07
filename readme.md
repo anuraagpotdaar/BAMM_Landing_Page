@@ -1,3 +1,3 @@
-# BAMM, Body Avatar Motion Model
+# BAMM Landing Page
 
 ![BAMM landing page walkthrough](videos/bamm-landing.gif)
